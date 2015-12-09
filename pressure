@@ -1,0 +1,126 @@
+#!/usr/bin/env python
+
+import datetime, Queue, select, sys, threading, time
+
+__version__ = "0.1.0"
+
+def main():
+    threshold_events = EventStream()
+    rate_events = EventStream()
+    writer = threading.Thread(target=write, args=[threshold_events])
+    writer.daemon = True
+    writer.start()
+
+    thresholder = threading.Thread(target=threshold, args=[rate_events, threshold_events, 1])
+    thresholder.daemon = True
+    thresholder.start()
+
+    input_events = EventStream()
+    summarizer = threading.Thread(target=summarize, args=[input_events, rate_events])
+    summarizer.daemon = True
+    summarizer.start()
+
+    clock = threading.Thread(target=tick, args=[input_events, 1])
+    clock.daemon = True
+    clock.start()
+
+    reader = threading.Thread(target=timestamp_inputs, args=[input_events])
+    reader.start()
+    reader.join()
+
+class EventStream:
+    def __init__(self):
+        self._message_queue = Queue.Queue()
+        self._handlers = {}
+        self._running = False
+
+    def emit(self, name, data):
+        self._message_queue.put((name, data))
+
+    def on(self, name, handler):
+        if name in self._handlers:
+            self._handlers[name].append(handler)
+        else:
+            self._handlers[name] = [handler]
+
+    def run(self):
+        while True:
+            message, data = self._message_queue.get()
+            if message is None:
+                break
+            if message in self._handlers:
+                for handler in self._handlers[message]:
+                    handler(data)
+
+    def quit(self):
+        self.emit(None, None)
+
+def timestamp_inputs(output):
+    while sys.stdin in select.select([sys.stdin], [], [])[0]:
+        line = sys.stdin.readline()
+        if not line:
+            output.quit()
+            return
+        now = datetime.datetime.utcnow()
+        output.emit("line", now)
+
+def tick(output, period):
+    while True:
+        time.sleep(period)
+        output.emit("tick", period)
+
+def summarize(input_, output):
+    class Summarizer:
+        def __init__(self, output):
+            self._times = []
+            self._window = 5
+            self._output = output
+
+        def save_time(self, time):
+            self._times.append(time)
+
+        def send_summary(self, _):
+            now = datetime.datetime.utcnow()
+            self._times = [t for t in self._times if now - datetime.timedelta(seconds=self._window) < t]
+            self._output.emit("rate", len(self._times) / float(self._window))
+
+    s = Summarizer(output)
+    input_.on("line", s.save_time)
+    input_.on("tick", s.send_summary)
+    input_.run()
+
+def threshold(input_, output, threshold):
+    class Thresholder:
+        def __init__(self, output, threshold):
+            self._threshold = threshold 
+            self._rate = 0
+            self._output = output
+
+        def rate(self, current_rate):
+            # print self._rate, self._threshold, current_rate
+            if self._rate < self._threshold <= current_rate:
+                self._output.emit("threshold.above", current_rate)
+            elif current_rate < self._threshold <= self._rate:
+                self._output.emit("threshold.below", current_rate)
+            self._rate = current_rate
+    t = Thresholder(output, threshold)
+    input_.on("rate", t.rate)
+    input_.run()
+
+def write(input_):
+    def rate(rate):
+        print rate
+    def above_threshold(rate):
+        print "reached threshold at", datetime.datetime.now()
+    def below_threshold(rate):
+        print "fell below threshold at", datetime.datetime.now()
+    input_.on("rate", rate)
+    input_.on("threshold.above", above_threshold)
+    input_.on("threshold.below", below_threshold)
+    input_.run()
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
