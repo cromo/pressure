@@ -4,23 +4,25 @@ import datetime, Queue, select, sys, threading, time
 
 __version__ = "0.1.0"
 
-def main():
+def main(mode, update_rate, threshold_rate, window_seconds):
     threshold_events = EventStream()
     rate_events = EventStream()
-    writer = threading.Thread(target=write, args=[threshold_events])
+    writer_input = rate_events if mode == 'guage' else threshold_events
+    writer = threading.Thread(target=write, args=[writer_input])
     writer.daemon = True
     writer.start()
 
-    thresholder = threading.Thread(target=threshold, args=[rate_events, threshold_events, 1])
-    thresholder.daemon = True
-    thresholder.start()
+    if mode == 'threshold':
+        thresholder = threading.Thread(target=threshold, args=[rate_events, threshold_events, threshold_rate])
+        thresholder.daemon = True
+        thresholder.start()
 
     input_events = EventStream()
-    summarizer = threading.Thread(target=summarize, args=[input_events, rate_events])
+    summarizer = threading.Thread(target=summarize, args=[input_events, rate_events, window_seconds])
     summarizer.daemon = True
     summarizer.start()
 
-    clock = threading.Thread(target=tick, args=[input_events, 1])
+    clock = threading.Thread(target=tick, args=[input_events, update_rate])
     clock.daemon = True
     clock.start()
 
@@ -69,11 +71,11 @@ def tick(output, period):
         time.sleep(period)
         output.emit("tick", period)
 
-def summarize(input_, output):
+def summarize(input_, output, window):
     class Summarizer:
-        def __init__(self, output):
+        def __init__(self, output, window):
             self._times = []
-            self._window = 5
+            self._window = window
             self._output = output
 
         def save_time(self, time):
@@ -84,7 +86,7 @@ def summarize(input_, output):
             self._times = [t for t in self._times if now - datetime.timedelta(seconds=self._window) < t]
             self._output.emit("rate", len(self._times) / float(self._window))
 
-    s = Summarizer(output)
+    s = Summarizer(output, window)
     input_.on("line", s.save_time)
     input_.on("tick", s.send_summary)
     input_.run()
@@ -97,7 +99,6 @@ def threshold(input_, output, threshold):
             self._output = output
 
         def rate(self, current_rate):
-            # print self._rate, self._threshold, current_rate
             if self._rate < self._threshold <= current_rate:
                 self._output.emit("threshold.above", current_rate)
             elif current_rate < self._threshold <= self._rate:
@@ -111,7 +112,7 @@ def write(input_):
     def rate(rate):
         print rate
     def above_threshold(rate):
-        print "reached threshold at", datetime.datetime.now()
+        print "rose above threshold at", datetime.datetime.now()
     def below_threshold(rate):
         print "fell below threshold at", datetime.datetime.now()
     input_.on("rate", rate)
@@ -119,8 +120,57 @@ def write(input_):
     input_.on("threshold.below", below_threshold)
     input_.run()
 
+def parse_args(args):
+    options = {
+        'guage': False,
+        'threshold': False,
+        '--interval': 1,
+        '--window': 3,
+        '<rate>': None
+    }
+    expecting_argument = ''
+    for arg in args:
+        if expecting_argument:
+            if expecting_argument == '--interval':
+                options['--interval'] = float(arg)
+            elif expecting_argument == '--window':
+                options['--window'] = float(arg)
+            expecting_argument = ''
+        elif arg in ('-n', '--interval'):
+            expecting_argument = '--interval'
+        elif arg in ('-w', '--window'):
+            expecting_argument = '--window'
+        elif arg == 'guage':
+            options['guage'] = True
+        elif arg == 'threshold':
+            options['threshold'] = True
+        else:
+            options['<rate>'] = float(arg)
+    both_guage_and_threshold = options['guage'] and options['threshold']
+    neither_guage_nor_threshold = not (options['guage'] or options['threshold'])
+    rate_specified_for_guage = options['guage'] and options['<rate>']
+    no_rate_for_threshold = options['threshold'] and not options['<rate>']
+    if both_guage_and_threshold or neither_guage_nor_threshold or rate_specified_for_guage or no_rate_for_threshold:
+        print_usage()
+        sys.exit(1)
+    return options
+
+def print_usage():
+    sys.stderr.write("""Usage:
+
+  %s guage [--interval <interval>]
+  %s threshold <rate> [--interval <interval>]
+
+Measure the flow of data through a pipe.
+
+Flags:
+-n --interval  How frequently to recalculate the current rate. Default 1.
+-w --window    The period of time to look at to calculate the current rate. Default 3.
+""" % (sys.argv[0], sys.argv[0]))
+
 if __name__ == '__main__':
+    options = parse_args(sys.argv[1:])
     try:
-        main()
+        main('guage' if options['guage'] else 'threshold', options['--interval'], options['<rate>'], options['--window'])
     except KeyboardInterrupt:
         pass
